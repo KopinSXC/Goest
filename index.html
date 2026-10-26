@@ -81,6 +81,11 @@ body {
 .pill[data-s="danger"]::before { background: var(--danger); }
 .pill[data-s="danger"] { border-color: var(--danger); }
 .hint { color: var(--muted); font-size: 12px; min-width: 0; flex: 1 1 180px; }
+
+/* debug panel: sits above the overlay, never catches taps so demo-mode clicks still reach the map */
+.dbgBtn { font: inherit; font-size: 12px; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+.dbgBtn[aria-pressed="true"] { color: var(--fg); border-color: var(--route); }
+.dbg { position: absolute; left: 8px; top: 8px; z-index: 5; max-width: calc(100% - 16px); margin: 0; padding: 8px 10px; border-radius: 8px; background: rgba(0, 0, 0, .72); color: #cfe3d4; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; pointer-events: none; }
 </style>
 
 <div class="app">
@@ -95,6 +100,7 @@ body {
     <canvas id="c" aria-label="游戏地图"></canvas>
     <div class="toast" id="toast"></div>
     <div class="power"><i id="powerFill"></i></div>
+    <pre class="dbg" id="dbg" hidden></pre>
     <div class="overlay" id="overlay">
       <div class="card">
         <p class="eyebrow" id="ovEyebrow">GPS 定位玩法</p>
@@ -118,6 +124,7 @@ body {
     <div class="pill" id="threat" data-s="none">最近的鬼 —</div>
     <div class="pill" id="gps" data-s="none">定位未开启</div>
     <div class="hint" id="hint"></div>
+    <button class="dbgBtn" id="dbgBtn" type="button" aria-pressed="false">调试</button>
   </footer>
 </div>
 
@@ -151,6 +158,11 @@ body {
   var accMax = 60, gotFixes = 0, locStart = 0;
   var beans = [], ghosts = [], invuln = 0, toastT = 0, frightMax = 8, lastVib = 0;
   try { best = parseInt(localStorage.getItem('ghostbean-best') || '0', 10) || 0; } catch (e) {}
+  // debug-only bookkeeping: raw fix, arrival intervals, last errors, wake lock state
+  var dbg = { on: false, raw: null, lastArr: 0, gap: 0, gaps: [], errs: [], wake: '未请求', geoErr: '—' };
+  function logErr(s) { dbg.errs.unshift(new Date().toTimeString().slice(0, 8) + ' ' + s); dbg.errs.length = Math.min(dbg.errs.length, 3); }
+  window.addEventListener('error', function (ev) { logErr('JS: ' + (ev.message || ev.type) + (ev.lineno ? ' @' + ev.lineno : '')); });
+  window.addEventListener('unhandledrejection', function (ev) { logErr('Promise: ' + ((ev.reason && ev.reason.message) || ev.reason)); });
 
   var el = {
     score: document.getElementById('score'), beans: document.getElementById('beans'),
@@ -221,17 +233,34 @@ body {
     var n = wanted(); for (var k = 0; k < n; k++) addGhost();
     hud();
   }
-  function wake() { try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(function () {}); } catch (e) {} }
+  // the browser drops the wake lock whenever the page is hidden, so it is re-requested on return (see visibilitychange below)
+  var wakeLock = null;
+  function wake() {
+    if (wakeLock || document.visibilityState === 'hidden') return;
+    if (!navigator.wakeLock) { dbg.wake = '不支持'; if (mode === 'gps') toast('浏览器不支持防熄屏，请在系统设置里延长自动锁屏时间'); return; }
+    try {
+      navigator.wakeLock.request('screen').then(function (s) {
+        wakeLock = s; dbg.wake = '已开启';
+        s.addEventListener('release', function () { wakeLock = null; dbg.wake = '已释放'; });
+      }).catch(function (e) { dbg.wake = '失败: ' + (e && e.name); logErr('wakeLock ' + (e && e.message)); });
+    } catch (e) { dbg.wake = '失败: ' + e.name; }
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && state === 'play') wake();
+  });
   function begin() {
     state = 'play'; el.ov.hidden = true; newLevel(); wake();
+    if (mode === 'gps') watchGeo();
     el.hint.textContent = mode === 'gps' ? '带着手机走起来，走到豆子上就吃到' : '点地图任意位置，你会走过去 · 也可以用方向键';
   }
 
   /* ---------- position sources ---------- */
   function stopGeo() { if (watchId !== null) { try { navigator.geolocation.clearWatch(watchId); } catch (e) {} watchId = null; } }
   function onFix(pos) {
-    var c = pos.coords;
+    var c = pos.coords, tArr = performance.now();
     gotFixes++;
+    if (dbg.lastArr) { dbg.gap = (tArr - dbg.lastArr) / 1000; dbg.gaps.push(dbg.gap); if (dbg.gaps.length > 10) dbg.gaps.shift(); }
+    dbg.lastArr = tArr; dbg.raw = { lat: c.latitude, lon: c.longitude, acc: c.accuracy, speed: c.speed, heading: c.heading, ts: pos.timestamp };
     lastLL = { lat: c.latitude, lon: c.longitude }; acc = c.accuracy;
     if (!origin) { origin = { lat: c.latitude, lon: c.longitude }; MX = 111320 * Math.cos(origin.lat * Math.PI / 180); }
     fix = { x: (c.longitude - origin.lon) * MX, y: (c.latitude - origin.lat) * MY, acc: c.accuracy, t: performance.now() };
@@ -246,12 +275,17 @@ body {
   }
   function onGeoErr(err) {
     var code = err && err.code;
+    dbg.geoErr = 'code ' + code + (err && err.message ? ' ' + err.message : '');
+    logErr('geo ' + dbg.geoErr);
     if (state === 'locating') {
       stopGeo(); state = 'menu';
       showOverlay('error', code === 1
         ? '没能获得定位。可能是权限被拒绝，也可能是当前页面被浏览器禁止使用定位（嵌入式预览通常如此）。请在手机浏览器里用 https 网址直接打开本页，并允许定位。'
         : '定位超时或失败，请到室外空旷处再试一次。');
-    } else if (code === 1) { stopGeo(); toast('定位权限被关闭了'); }
+    } else if (code === 1) {
+      stopGeo(); toast('定位权限被关闭了');
+      el.hint.textContent = '定位权限被关闭，位置不会再更新。请在浏览器设置里允许定位后刷新页面。';
+    }
   }
   function startLenient() {
     if (!fix) return;
@@ -259,15 +293,22 @@ body {
     toast('定位精度较差，抓豆和被抓的判定会不准');
   }
   function startGeo() {
-    if (!('geolocation' in navigator) || !window.isSecureContext) {
+    // only an explicit false blocks; older browsers without isSecureContext still get to try
+    if (!('geolocation' in navigator) || window.isSecureContext === false) {
       showOverlay('error', '这个页面无法使用定位。请在手机浏览器里用 https 网址直接打开，并允许定位。'); return;
     }
+    stopGeo();
     mode = 'gps'; scale = 1; origin = null; fix = null; lastLL = null; state = 'locating';
-    accMax = 60; gotFixes = 0; locStart = Date.now();
+    accMax = 60; gotFixes = 0; locStart = Date.now(); dbg.lastArr = 0; dbg.gaps = [];
     level = 1; score = 0; lives = 3;
     showOverlay('locating');
+    watchGeo();
+  }
+  // (re)start the watch if it is not running, e.g. after it was stopped by a permission error mid-game
+  function watchGeo() {
+    if (watchId !== null) return;
     try { watchId = navigator.geolocation.watchPosition(onFix, onGeoErr, { enableHighAccuracy: true, maximumAge: 1000, timeout: 30000 }); }
-    catch (e) { onGeoErr({ code: 0 }); }
+    catch (e) { onGeoErr({ code: 0, message: e.message }); }
   }
   function startSim() {
     stopGeo(); mode = 'sim'; scale = 3.5; level = 1; score = 0; lives = 3; acc = 5; P.x = 0; P.y = 0; begin();
@@ -508,6 +549,8 @@ body {
 
   /* ---------- input (demo mode only) ---------- */
   cv.addEventListener('pointerdown', function (ev) {
+    // GPS mode starts from a location callback, not a tap; some browsers refuse the wake lock then, so retry on any tap
+    if (state === 'play' && !wakeLock) wake();
     if (state !== 'play' || mode !== 'sim') return;
     var r = cv.getBoundingClientRect();
     sim.tx = (ev.clientX - r.left - W / 2) / PPM + camP.x; sim.ty = -(ev.clientY - r.top - H / 2) / PPM + camP.y;
@@ -527,6 +570,45 @@ body {
       el.ovX.textContent = '已等待 ' + s + ' 秒，还没收到定位。如果弹出了权限提示请选“允许”。室内或没有 GPS 的设备可能一直收不到。';
     }
   }, 1000);
+
+  /* ---------- debug panel (toggle with the 调试 button or ?debug=1; remembered per device) ---------- */
+  var dbgEl = document.getElementById('dbg'), dbgBtn = document.getElementById('dbgBtn');
+  function setDbg(on) {
+    dbg.on = on; dbgEl.hidden = !on; dbgBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    try { localStorage.setItem('ghostbean-debug', on ? '1' : '0'); } catch (e) {}
+    if (on) renderDbg();
+  }
+  function f(n, d) { return n == null || isNaN(n) ? '—' : n.toFixed(d); }
+  function renderDbg() {
+    var now = performance.now(), r = dbg.raw, L = [], i, g;
+    L.push('状态 ' + state + ' · 模式 ' + mode + ' · 可见 ' + document.visibilityState);
+    if (r) {
+      L.push('纬度 ' + f(r.lat, 6) + '  经度 ' + f(r.lon, 6));
+      L.push('精度 ±' + f(r.acc, 1) + ' m（门槛 ' + accMax + '）' + (r.acc > accMax ? ' ✗ 超门槛，位置冻结' : ''));
+      L.push('GPS 速度 ' + f(r.speed, 2) + ' m/s  朝向 ' + f(r.heading, 0) + '°');
+      var avg = dbg.gaps.length ? dbg.gaps.reduce(function (a, b) { return a + b; }, 0) / dbg.gaps.length : NaN;
+      L.push('更新间隔 ' + f(dbg.gap, 2) + ' s（近' + dbg.gaps.length + '次均 ' + f(avg, 2) + ' s）');
+      L.push('距上次定位 ' + f((now - dbg.lastArr) / 1000, 1) + ' s · 定位龄 ' + f((Date.now() - r.ts) / 1000, 1) + ' s · 共 ' + gotFixes + ' 次');
+      if (fix) L.push('原始→显示偏差 ' + f(Math.hypot(fix.x - P.x, fix.y - P.y), 1) + ' m · 离起点 ' + f(Math.hypot(P.x, P.y), 0) + ' m');
+    } else L.push('还没有收到定位');
+    var md = Infinity, mg = null;
+    for (i = 0; i < ghosts.length; i++) {
+      g = ghosts[i]; if (g.spawn > 0) continue;
+      var d = Math.hypot(g.x - P.x, g.y - P.y); if (d < md) { md = d; mg = g; }
+    }
+    L.push('最近的鬼 ' + (mg ? f(md, 1) + ' m（类型 ' + mg.type + (mg.fright > 0 ? '，虚弱' : '') + '）' : '—') + ' · 共 ' + ghosts.length + ' 只');
+    if (state === 'play' && mode === 'gps') L.push('吃豆半径 ' + f(Math.max(10, Math.min(16, acc * .6)), 1) + ' m · 被抓半径 ' + f(Math.max(6, Math.min(12, acc * .5)), 1) + ' m');
+    L.push('防熄屏 ' + dbg.wake + ' · 震动 ' + ('vibrate' in navigator ? '支持' : '不支持') + ' · https ' + (window.isSecureContext ? '是' : '否'));
+    L.push('定位错误 ' + dbg.geoErr);
+    for (i = 0; i < dbg.errs.length; i++) L.push('! ' + dbg.errs[i]);
+    dbgEl.textContent = L.join('\n');
+  }
+  dbgBtn.addEventListener('click', function () { setDbg(!dbg.on); });
+  var dbgInit = /[?&]debug=1/.test(location.search);
+  try { if (localStorage.getItem('ghostbean-debug') === '1') dbgInit = true; } catch (e) {}
+  setDbg(dbgInit);
+  setInterval(function () { if (dbg.on) renderDbg(); }, 250);
+
   var lastTs = 0;
   function frame(ts) {
     var dt = Math.min(.1, (ts - lastTs) / 1000 || 0); lastTs = ts;
