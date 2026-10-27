@@ -159,7 +159,7 @@ body {
   var beans = [], ghosts = [], invuln = 0, toastT = 0, frightMax = 8, lastVib = 0;
   try { best = parseInt(localStorage.getItem('ghostbean-best') || '0', 10) || 0; } catch (e) {}
   // debug-only bookkeeping: raw fix, arrival intervals, last errors, wake lock state
-  var dbg = { on: false, raw: null, lastArr: 0, gap: 0, gaps: [], errs: [], wake: '未请求', geoErr: '—' };
+  var dbg = { on: false, raw: null, rawPos: null, filt: '—', jumps: 0, lastArr: 0, gap: 0, gaps: [], errs: [], wake: '未请求', geoErr: '—' };
   function logErr(s) { dbg.errs.unshift(new Date().toTimeString().slice(0, 8) + ' ' + s); dbg.errs.length = Math.min(dbg.errs.length, 3); }
   window.addEventListener('error', function (ev) { logErr('JS: ' + (ev.message || ev.type) + (ev.lineno ? ' @' + ev.lineno : '')); });
   window.addEventListener('unhandledrejection', function (ev) { logErr('Promise: ' + ((ev.reason && ev.reason.message) || ev.reason)); });
@@ -263,15 +263,43 @@ body {
     dbg.lastArr = tArr; dbg.raw = { lat: c.latitude, lon: c.longitude, acc: c.accuracy, speed: c.speed, heading: c.heading, ts: pos.timestamp };
     lastLL = { lat: c.latitude, lon: c.longitude }; acc = c.accuracy;
     if (!origin) { origin = { lat: c.latitude, lon: c.longitude }; MX = 111320 * Math.cos(origin.lat * Math.PI / 180); }
-    fix = { x: (c.longitude - origin.lon) * MX, y: (c.latitude - origin.lat) * MY, acc: c.accuracy, t: performance.now() };
+    filterFix((c.longitude - origin.lon) * MX, (c.latitude - origin.lat) * MY, c.accuracy, c.speed, pos.timestamp);
     if (c.heading != null && !isNaN(c.heading) && c.speed > .5) heading = Math.PI / 2 - c.heading * Math.PI / 180;
     if (state === 'locating') {
-      if (c.accuracy <= 40) { P.x = fix.x; P.y = fix.y; begin(); }
+      // the first fixes are often Wi-Fi/cell guesses; wait for a short run of good ones so the start point does not jump
+      goodRun = c.accuracy <= START_ACC ? goodRun + 1 : 0;
+      if (goodRun >= START_RUN) begin();
       else {
-        el.ovX.textContent = '已收到定位，当前精度约 ' + Math.round(c.accuracy) + ' m，理想是 40 m 以内。到室外空旷处会更准，也可以先开始。';
+        el.ovX.textContent = '已收到定位，当前精度约 ' + Math.round(c.accuracy) + ' m。需要连续 ' + START_RUN + ' 次在 ' + START_ACC +
+          ' m 以内才开始（现在 ' + goodRun + '/' + START_RUN + '）。到室外空旷处会更快，也可以先开始。';
         el.ovB2.hidden = false; el.ovB2.textContent = '精度差也先开始';
       }
     }
+  }
+  // fix is the filtered position the player dot chases. Raw fixes inside the jitter radius are ignored while standing
+  // still, and physically impossible jumps are dropped (unless they keep coming, in which case the GPS really moved).
+  var START_ACC = 20, START_RUN = 3, JUMP_SPEED = 8, JUMP_MIN = 20, JUMP_MAX_SKIP = 4;
+  var goodRun = 0, lastRawTs = 0, jumpSkips = 0;
+  function filterFix(rx, ry, a, speed, ts) {
+    var now = performance.now();
+    dbg.rawPos = { x: rx, y: ry };
+    if (!fix) { fix = { x: rx, y: ry, acc: a, t: now }; lastRawTs = ts; dbg.filt = '首次定位'; return; }
+    var dx = rx - fix.x, dy = ry - fix.y, d = Math.hypot(dx, dy), sec = Math.max(.5, (ts - lastRawTs) / 1000);
+    lastRawTs = ts;
+    if (d > JUMP_MIN && d / sec > JUMP_SPEED && jumpSkips < JUMP_MAX_SKIP) {
+      jumpSkips++; dbg.jumps = (dbg.jumps || 0) + 1; dbg.filt = '跳点丢弃 ' + Math.round(d) + ' m';
+      fix.t = now; return;
+    }
+    jumpSkips = 0;
+    var moving = speed != null && speed >= .45;
+    if (moving) { fix.x = rx; fix.y = ry; dbg.filt = '移动中'; }
+    else {
+      // standing (or speed unknown): only follow once the raw fix leaves the dead zone, and only by the overshoot
+      var R = Math.max(2.5, Math.min(10, a * (speed == null || speed < 0 ? .4 : .5)));
+      if (d > R) { fix.x += dx / d * (d - R); fix.y += dy / d * (d - R); dbg.filt = '静止·跟随超出部分'; }
+      else dbg.filt = '静止锁定（死区 ' + R.toFixed(1) + ' m）';
+    }
+    fix.acc = a; fix.t = now;
   }
   function onGeoErr(err) {
     var code = err && err.code;
@@ -299,7 +327,7 @@ body {
     }
     stopGeo();
     mode = 'gps'; scale = 1; origin = null; fix = null; lastLL = null; state = 'locating';
-    accMax = 60; gotFixes = 0; locStart = Date.now(); dbg.lastArr = 0; dbg.gaps = [];
+    accMax = 60; gotFixes = 0; locStart = Date.now(); dbg.lastArr = 0; dbg.gaps = []; goodRun = 0; jumpSkips = 0; dbg.jumps = 0;
     level = 1; score = 0; lives = 3;
     showOverlay('locating');
     watchGeo();
@@ -589,7 +617,8 @@ body {
       var avg = dbg.gaps.length ? dbg.gaps.reduce(function (a, b) { return a + b; }, 0) / dbg.gaps.length : NaN;
       L.push('更新间隔 ' + f(dbg.gap, 2) + ' s（近' + dbg.gaps.length + '次均 ' + f(avg, 2) + ' s）');
       L.push('距上次定位 ' + f((now - dbg.lastArr) / 1000, 1) + ' s · 定位龄 ' + f((Date.now() - r.ts) / 1000, 1) + ' s · 共 ' + gotFixes + ' 次');
-      if (fix) L.push('原始→显示偏差 ' + f(Math.hypot(fix.x - P.x, fix.y - P.y), 1) + ' m · 离起点 ' + f(Math.hypot(P.x, P.y), 0) + ' m');
+      if (fix) L.push('原始→过滤 ' + (dbg.rawPos ? f(Math.hypot(dbg.rawPos.x - fix.x, dbg.rawPos.y - fix.y), 1) : '—') + ' m · 过滤→显示 ' + f(Math.hypot(fix.x - P.x, fix.y - P.y), 1) + ' m · 离起点 ' + f(Math.hypot(P.x, P.y), 0) + ' m');
+      L.push('滤波 ' + dbg.filt + ' · 已丢弃跳点 ' + (dbg.jumps || 0) + ' 次');
     } else L.push('还没有收到定位');
     var md = Infinity, mg = null;
     for (i = 0; i < ghosts.length; i++) {
