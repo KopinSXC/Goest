@@ -193,7 +193,12 @@ body {
       if (Math.hypot(x, y) > AREA || Math.hypot(x, y) < 12) continue;
       beans.push({ x: x, y: y, on: true, power: false });
     }
+    pickPower();
+  }
+  function pickPower() {
     var far = beans.filter(function (b) { return Math.hypot(b.x, b.y) > 75; });
+    // small street maps may have few beans that far out; fall back to the outer third
+    if (far.length < 6) far = beans.slice().sort(function (a, b) { return Math.hypot(b.x, b.y) - Math.hypot(a.x, a.y); }).slice(0, Math.ceil(beans.length / 3));
     for (var k = 0; k < 3; k++) {
       var want = k * 2.094 + rnd(0, 1), bb = null, bs = -9;
       far.forEach(function (b) { var s = Math.cos(Math.atan2(b.y, b.x) - want); if (s > bs && !b.power) { bs = s; bb = b; } });
@@ -225,11 +230,83 @@ body {
     if (prog > .7) n++;
     return Math.min(3, n);
   }
+  /* ---------- streets: beans in Pac-Man rows along real walkable ways (OpenStreetMap via Overpass) ---------- */
+  // roads keeps the raw lat/lon ways and the point they were fetched around; streets is the same in local meters
+  var roads = null, streets = null, mapToken = 0, layout = 'grid';
+  var ROAD_R = AREA + 40, ROAD_REUSE = 40, ROAD_TIMEOUT = 12000;
+  var OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
+  function llDist(a, b) { return Math.hypot((a.lon - b.lon) * 111320 * Math.cos(a.lat * Math.PI / 180), (a.lat - b.lat) * MY); }
+  function roadsNear(ll) { return roads && llDist(roads.c, ll) < ROAD_REUSE; }
+  function fetchRoads(c) {
+    // big car roads, stairs, private and no-foot ways are left out so beans never lead onto them
+    var q = '[out:json][timeout:10];way(around:' + ROAD_R + ',' + c.lat.toFixed(6) + ',' + c.lon.toFixed(6) + ')["highway"]' +
+      '["highway"!~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|steps|construction|proposed|raceway|bus_guideway|corridor|elevator|escape|platform)$"]' +
+      '["access"!~"^(private|no)$"]["foot"!="no"]["area"!="yes"];out geom;';
+    if (!window.fetch) return Promise.reject(new Error('浏览器不支持 fetch'));
+    var deadline = Date.now() + ROAD_TIMEOUT;
+    function attempt(i) {
+      if (i >= OVERPASS.length || Date.now() >= deadline) return Promise.reject(new Error('街道数据服务都连不上'));
+      var ctl = window.AbortController ? new AbortController() : null;
+      var timer = setTimeout(function () { if (ctl) ctl.abort(); }, Math.max(1000, Math.min(7000, deadline - Date.now())));
+      return fetch(OVERPASS[i], { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctl ? ctl.signal : undefined,
+                                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function (data) {
+          clearTimeout(timer); dbg.roadSrc = OVERPASS[i].split('/')[2];
+          return (data.elements || []).filter(function (e) { return e.type === 'way' && e.geometry && e.geometry.length > 1; })
+            .map(function (e) { return { hw: e.tags && e.tags.highway, pts: e.geometry }; });
+        })
+        .catch(function (e) { clearTimeout(timer); logErr('街道 ' + OVERPASS[i].split('/')[2] + ': ' + (e.name === 'AbortError' ? '超时' : e.message)); return attempt(i + 1); });
+    }
+    return attempt(0);
+  }
+  function loadRoads() {
+    state = 'mapping'; showOverlay('mapping');
+    var tok = ++mapToken, c = { lat: lastLL.lat, lon: lastLL.lon };
+    fetchRoads(c).then(function (ways) { return { c: c, ways: ways }; }, function (e) { return { c: c, ways: [], err: e.message }; })
+      .then(function (r) { if (tok !== mapToken || state !== 'mapping') return; roads = r; begin(); });
+  }
+  function skipRoads() { if (!lastLL) return; mapToken++; roads = { c: { lat: lastLL.lat, lon: lastLL.lon }, ways: [], err: '已跳过' }; begin(); }
+  function streetBeans() {
+    var LEN = 0, i, k, w;
+    streets = roads.ways.map(function (w) {
+      return { hw: w.hw, pts: w.pts.map(function (p) { return { x: (p.lon - origin.lon) * MX, y: (p.lat - origin.lat) * MY }; }) };
+    });
+    // total walkable length inside the play area decides the spacing, so a dense block does not get hundreds of beans
+    for (i = 0; i < streets.length; i++) for (w = streets[i].pts, k = 1; k < w.length; k++) {
+      var mx = (w[k].x + w[k - 1].x) / 2, my = (w[k].y + w[k - 1].y) / 2;
+      if (Math.hypot(mx, my) <= AREA) LEN += Math.hypot(w[k].x - w[k - 1].x, w[k].y - w[k - 1].y);
+    }
+    var SP = Math.max(14, LEN / 120), MIN = SP * .65;
+    beans = [];
+    function put(x, y) {
+      if (Math.hypot(x, y) > AREA || Math.hypot(x, y) < 12) return;
+      for (var j = 0; j < beans.length; j++) if (Math.hypot(beans[j].x - x, beans[j].y - y) < MIN) return;
+      beans.push({ x: x, y: y, on: true, power: false });
+    }
+    // walk every way and drop a bean each SP meters; neighbours closer than MIN (crossings, parallel lanes) are merged
+    for (i = 0; i < streets.length; i++) {
+      w = streets[i].pts; var s = 0;   // s: distance into the current segment where the next bean goes
+      for (k = 1; k < w.length; k++) {
+        var ax = w[k - 1].x, ay = w[k - 1].y, sl = Math.hypot(w[k].x - ax, w[k].y - ay);
+        for (; s <= sl; s += SP) put(ax + (w[k].x - ax) * s / (sl || 1), ay + (w[k].y - ay) * s / (sl || 1));
+        s -= sl;
+      }
+    }
+    if (beans.length < 12) { streets = null; return false; }
+    pickPower(); return true;
+  }
+  function placeBeans() {
+    layout = 'grid'; streets = null;
+    if (mode === 'gps' && roads && roads.ways.length && streetBeans()) { layout = 'street'; return; }
+    genBeans();
+    if (mode === 'gps' && roads) toast(roads.err === '已跳过' ? '已跳过街道，使用普通布局' : roads.err ? '没读到街道数据，改用普通布局' : '附近可走的街道太少，改用普通布局');
+  }
   function newLevel() {
     reorigin();
     if (mode === 'sim') { P.x = 0; P.y = 0; sim.tx = 0; sim.ty = 0; }
     camP.x = P.x; camP.y = P.y; pv.x = 0; pv.y = 0;
-    genBeans(); total = beans.length; eaten = 0; ghosts = []; invuln = 3;
+    placeBeans(); total = beans.length; eaten = 0; ghosts = []; invuln = 3;
     var n = wanted(); for (var k = 0; k < n; k++) addGhost();
     hud();
   }
@@ -249,6 +326,8 @@ body {
     if (document.visibilityState === 'visible' && state === 'play') wake();
   });
   function begin() {
+    // in GPS mode the streets around the (new) start point are read first; loadRoads() calls begin() again when done
+    if (mode === 'gps' && lastLL && !roadsNear(lastLL)) { loadRoads(); return; }
     state = 'play'; el.ov.hidden = true; newLevel(); wake();
     if (mode === 'gps') watchGeo();
     el.hint.textContent = mode === 'gps' ? '带着手机走起来，走到豆子上就吃到' : '点地图任意位置，你会走过去 · 也可以用方向键';
@@ -345,14 +424,20 @@ body {
   /* ---------- overlay ---------- */
   function showOverlay(kind, msg) {
     ovKind = kind; el.ov.hidden = false;
-    el.ovR.hidden = kind !== 'menu'; el.ovN.hidden = kind !== 'menu'; el.ovB2.hidden = kind !== 'menu';
+    el.ovR.hidden = kind !== 'menu'; el.ovN.hidden = kind !== 'menu' && kind !== 'mapping'; el.ovB2.hidden = kind !== 'menu' && kind !== 'mapping';
     if (kind === 'menu') {
       el.ovEy.textContent = 'GPS 定位玩法'; el.ovT.textContent = '躲鬼吃豆';
       el.ovX.textContent = '现实里只有你一个人在走。手机地图上，AI 会在你附近生成鬼，并朝你逼近。';
+      el.ovN.textContent = '走路时留意车辆和周围，不要边走边盯着屏幕。';
       el.ovB.textContent = '用真实定位开始'; el.ovB2.textContent = '演示模式（点地图走路）';
     } else if (kind === 'locating') {
       el.ovEy.textContent = '定位中'; el.ovT.textContent = '正在获取 GPS';
       el.ovX.textContent = '请允许定位权限，并尽量站在室外空旷处。'; el.ovB.textContent = '取消';
+    } else if (kind === 'mapping') {
+      el.ovEy.textContent = '准备地图'; el.ovT.textContent = '读取附近街道';
+      el.ovX.textContent = '正在从 OpenStreetMap 读取周围可步行的街道，豆子会沿街道排成一排。最多等 ' + ROAD_TIMEOUT / 1000 + ' 秒，读不到就用普通布局。';
+      el.ovN.textContent = '豆子在街道中线上，走人行道也能吃到。过马路请看车，不要为了吃豆走进车道。';
+      el.ovB.textContent = '取消'; el.ovB2.textContent = '跳过，用普通布局';
     } else if (kind === 'error') {
       el.ovEy.textContent = '无法定位'; el.ovT.textContent = '没拿到 GPS'; el.ovX.textContent = msg; el.ovB.textContent = '返回';
     } else if (kind === 'over') {
@@ -366,11 +451,11 @@ body {
   }
   el.ovB.addEventListener('click', function () {
     if (ovKind === 'menu') startGeo();
-    else if (ovKind === 'locating' || ovKind === 'error') { stopGeo(); state = 'menu'; showOverlay('menu'); }
+    else if (ovKind === 'locating' || ovKind === 'error' || ovKind === 'mapping') { mapToken++; stopGeo(); state = 'menu'; showOverlay('menu'); }
     else if (ovKind === 'clear') { level++; begin(); }
     else { level = 1; score = 0; lives = 3; begin(); }
   });
-  el.ovB2.addEventListener('click', function () { if (ovKind === 'locating') startLenient(); else startSim(); });
+  el.ovB2.addEventListener('click', function () { if (ovKind === 'locating') startLenient(); else if (ovKind === 'mapping') skipRoads(); else startSim(); });
 
   /* ---------- game rules ---------- */
   function saveBest() { if (score > best) { best = score; try { localStorage.setItem('ghostbean-best', String(best)); } catch (e) {} } }
@@ -499,6 +584,18 @@ body {
     ctx.fillStyle = '#4c6178'; ctx.beginPath(); ctx.arc(sx(0), sy(0), 3, 0, 7); ctx.fill();
     ctx.fillText('起点', sx(0) + 7, sy(0) + 3);
 
+    // streets as maze corridors: a wide blue stroke, then a narrower dark one on top, so crossings merge into one hall
+    if (streets) {
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      for (var sp2 = 0; sp2 < 2; sp2++) for (var wi = 0; wi < streets.length; wi++) {
+        var sw = streets[wi], foot = /^(footway|path|pedestrian|cycleway|track)$/.test(sw.hw), wm = foot ? 5 : 8;
+        ctx.strokeStyle = sp2 ? '#0d1520' : '#22408f'; ctx.lineWidth = Math.max(sp2 ? 3 : 6, wm * PPM - (sp2 ? 4 : 0));
+        ctx.beginPath();
+        for (var pk = 0; pk < sw.pts.length; pk++) ctx[pk ? 'lineTo' : 'moveTo'](sx(sw.pts[pk].x), sy(sw.pts[pk].y));
+        ctx.stroke();
+      }
+      ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
+    }
     // range rings around the player
     var px = sx(P.x), py = sy(P.y);
     [25, 50, 100].forEach(function (r) {
@@ -628,6 +725,7 @@ body {
     L.push('最近的鬼 ' + (mg ? f(md, 1) + ' m（类型 ' + mg.type + (mg.fright > 0 ? '，虚弱' : '') + '）' : '—') + ' · 共 ' + ghosts.length + ' 只');
     if (state === 'play' && mode === 'gps') L.push('吃豆半径 ' + f(Math.max(10, Math.min(16, acc * .6)), 1) + ' m · 被抓半径 ' + f(Math.max(6, Math.min(12, acc * .5)), 1) + ' m');
     L.push('防熄屏 ' + dbg.wake + ' · 震动 ' + ('vibrate' in navigator ? '支持' : '不支持') + ' · https ' + (window.isSecureContext ? '是' : '否'));
+    L.push('豆子布局 ' + (layout === 'street' ? '沿街道' : '网格') + (roads ? ' · 街道 ' + roads.ways.length + ' 条' + (roads.err ? '（' + roads.err + '）' : ' · 来源 ' + (dbg.roadSrc || '—')) : ''));
     L.push('定位错误 ' + dbg.geoErr);
     for (i = 0; i < dbg.errs.length; i++) L.push('! ' + dbg.errs[i]);
     dbgEl.textContent = L.join('\n');
