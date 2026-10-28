@@ -40,7 +40,7 @@
 - 反馈：鬼靠近 20 米内震动（`navigator.vibrate`），屏幕边缘泛红，屏幕外的鬼用边缘箭头加距离提示。
 - 其他：`wakeLock` 防熄屏，`localStorage` 存最高分，全部带 try/catch。
 - 定位过滤（`filterFix()`）：开局要连续 3 次精度 ≤20 m；静止时（GPS 速度 <0.45 m/s）忽略死区内的抖动；一秒跳出 20 m 以上的点会被丢弃，连续 4 次才接受。
-- 街道布局（GPS 模式）：开局先读本站的街道切片 `streets/<lat*100>_<lon*100>.json`（见下方部署），这片区域没有切片时再用 Overpass API 读取半径 160 m 内可步行的道路（排除高速、主干道、台阶、私有道路），沿街道每隔约 14 m 放一颗豆，画成吃豆人式通道。读不到、太少或用户点"跳过"时回退到网格布局 `genBeans()`。鬼仍然直线追，不走路网。
+- 街道布局（GPS 模式）：开局先读本站的街道切片 `streets/<lat*100>_<lon*100>.json`（见下方部署），不在覆盖城市内时再用 Overpass API 读取半径 160 m 内可步行的道路（排除高速、主干道、台阶、私有道路），沿街道每隔约 14 m 放一颗豆，画成吃豆人式通道。读不到、太少或用户点"跳过"时回退到网格布局 `genBeans()`。鬼仍然直线追，不走路网。
 - 调试面板：底栏"调试"按钮或 `?debug=1`，显示定位、过滤、街道来源和最近错误。
 - 过关条件：吃到本关豆子的 90%（`CLEAR_PART`）即过关。没吃的和被点掉的豆子数记为 `carry`，加到下一关的过关目标里（目标不超过可吃的豆子数）。新游戏从第 1 关开始时清零。
 - 去掉吃不到的豆（仅 GPS 模式）：点一颗豆出现红色虚线圈，3 秒内再点一次即去掉，不加分。演示模式下点地图仍是走路。
@@ -57,10 +57,11 @@
 
 ## 4.1 当前部署方式（GitHub Actions）
 
-- `.github/workflows/pages.yml`：每次推送 main 或手动运行时，在 GitHub 的服务器上运行 `tools/build_streets.py`，从 Overpass 下载中心点周围 10 km 见方的可步行道路，切成 0.01° 的小块，和 `index.html` 一起发布到 Pages。
-- 切片只存在于 Pages 发布包里（保留 1 天后过期），**不提交到仓库**。中心坐标放在仓库机密 `STREETS_CENTER`（格式 `纬度,经度`，精确到城市即可），不写进代码，也不打印到日志。
-- 原因：国内手机直连 Overpass 的三个服务器全部超时（2026-10 实测），同源的 github.io 可以打开。
-- 需要的设置：Settings → Pages → Source 选 "GitHub Actions"；Settings → Secrets and variables → Actions 里加 `STREETS_CENTER`。
+- `.github/workflows/pages.yml`：推送 main、手动运行、每月 2 日定时运行。从 Geofabrik 下载全中国的 OSM 数据（约 1.4 GB），用 osmium 切出 `tools/cities.json` 里每个城市的方框，再由 `tools/build_streets.py` 过滤成可步行道路，切成 0.01° 的小块，和 `index.html` 一起发布到 Pages。
+- 切片放在 Actions 缓存里（按月和脚本内容生成缓存键），**不提交到仓库**。平时推送直接用缓存，不重新下载。
+- 游戏先读 `streets/coverage.json` 判断是否在覆盖城市内：在就读本站切片；不在才问国外的 Overpass 服务器（国内手机基本连不上，2026-10 实测三个都超时）；都不行用网格布局。
+- 增减城市：改 `tools/cities.json`（`half_km` 是方框半边长，公里），推送后自动重建。偏远省份（新疆、西藏、青海、宁夏、内蒙古、甘肃）暂未加入。
+- 需要的设置：Settings → Pages → Source 选 "GitHub Actions"。
 
 ## 5. 已知缺陷
 

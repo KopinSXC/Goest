@@ -1,13 +1,15 @@
-# Publishes the site to GitHub Pages together with street tiles built on the fly.
-# The tiles exist only in the Pages artifact; they are never committed to the repo.
-# Needs Settings > Pages > Source set to "GitHub Actions" and the repository secret
-# STREETS_CENTER ("lat,lon", city level is enough).
+# Publishes the site to GitHub Pages together with street tiles for the cities in
+# tools/cities.json. The tiles live in the Actions cache (rebuilt monthly) and in the
+# Pages artifact; they are never committed to the repo.
+# Needs Settings > Pages > Source set to "GitHub Actions".
 name: Deploy site
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '17 3 2 * *'   # monthly, picks up a new cache key and fresh map data
 
 permissions:
   contents: read
@@ -16,21 +18,34 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Copy site files
-        run: mkdir _site && cp index.html _site/
+      - name: Cache key
+        id: key
+        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: streets
+          key: streets-${{ steps.key.outputs.month }}-${{ hashFiles('tools/cities.json', 'tools/build_streets.py') }}
       - name: Build street tiles
+        if: steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
-        env:
-          STREETS_CENTER: ${{ secrets.STREETS_CENTER }}
-          STREETS_HALF_KM: "5"
-        run: python3 tools/build_streets.py _site/streets
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/china.osm.pbf" https://download.geofabrik.de/asia/china-latest.osm.pbf
+          python3 tools/build_streets.py "$RUNNER_TEMP/china.osm.pbf" tools/cities.json streets
+          rm -f "$RUNNER_TEMP/china.osm.pbf"
+      - name: Assemble site
+        run: |
+          mkdir _site && cp index.html _site/
+          if [ -d streets ]; then cp -r streets _site/streets; fi
+          du -sh _site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
@@ -38,6 +53,7 @@ jobs:
 
   deploy:
     needs: build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

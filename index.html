@@ -271,24 +271,31 @@ body {
     });
   }
   // street tiles published with the site (tools/build_streets.py); same origin, so it works where Overpass is blocked
-  var TILE = 100, TILE_TIMEOUT = 8000;
+  // coverage.json lists one [south, west, north, east] box per city; inside a box a missing tile just means no streets
+  var TILE = 100, TILE_TIMEOUT = 8000, coverage = null;
+  function getJSON(url) {
+    var ctl = window.AbortController ? new AbortController() : null, timer = setTimeout(function () { if (ctl) ctl.abort(); }, TILE_TIMEOUT);
+    return fetch(url, { signal: ctl ? ctl.signal : undefined })
+      .then(function (r) { clearTimeout(timer); return r.ok ? r.json() : null; })
+      .catch(function () { clearTimeout(timer); return null; });
+  }
   function fetchLocalRoads(c) {
     var t0 = Date.now(), dLat = ROAD_R / MY, dLon = ROAD_R / (111320 * Math.cos(c.lat * Math.PI / 180)), keys = {};
     [-1, 1].forEach(function (a) { [-1, 1].forEach(function (b) {
       keys[Math.floor((c.lat + a * dLat) * TILE) + '_' + Math.floor((c.lon + b * dLon) * TILE)] = 1;
     }); });
-    return Promise.all(Object.keys(keys).map(function (k) {
-      var ctl = window.AbortController ? new AbortController() : null, timer = setTimeout(function () { if (ctl) ctl.abort(); }, TILE_TIMEOUT);
-      return fetch('streets/' + k + '.json', { signal: ctl ? ctl.signal : undefined })
-        .then(function (r) { clearTimeout(timer); return r.ok ? r.json() : null; })
-        .catch(function () { clearTimeout(timer); return null; });
-    })).then(function (tiles) {
-      if (!tiles.some(Boolean)) throw new Error('本站没有这片区域的街道');
+    return (coverage ? Promise.resolve(coverage) : getJSON('streets/coverage.json')).then(function (cov) {
+      if (!cov) throw new Error('本站没有街道数据');
+      coverage = cov;
+      if (!cov.some(function (b) { return c.lat >= b[0] && c.lon >= b[1] && c.lat <= b[2] && c.lon <= b[3]; })) throw new Error('本站还没覆盖这座城市');
+      return Promise.all(Object.keys(keys).map(function (k) { return getJSON('streets/' + k + '.json'); }));
+    }).then(function (tiles) {
       var seen = {}, ways = [];
       tiles.forEach(function (t) { (t && t.w || []).forEach(function (w) {
         if (seen[w[0]]) return; seen[w[0]] = 1;
         var pts = [], near = false;
-        for (var i = 0; i < w[2].length; i += 2) pts.push({ lat: w[2][i], lon: w[2][i + 1] });
+        // integers in 1e-5 degrees, each point after the first stored as the change from the previous one
+        for (var i = 0, la = 0, lo = 0; i < w[2].length; i += 2) { la += w[2][i]; lo += w[2][i + 1]; pts.push({ lat: la / 1e5, lon: lo / 1e5 }); }
         // keep only ways that pass within ROAD_R of the start, tiles are much bigger than the play area
         for (i = 0; i < pts.length && !near; i++) {
           var a = pts[i], b = pts[i + 1] || a;
