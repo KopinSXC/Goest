@@ -235,32 +235,40 @@ body {
   /* ---------- streets: beans in Pac-Man rows along real walkable ways (OpenStreetMap via Overpass) ---------- */
   // roads keeps the raw lat/lon ways and the point they were fetched around; streets is the same in local meters
   var roads = null, streets = null, mapToken = 0, layout = 'grid';
-  var ROAD_R = AREA + 40, ROAD_REUSE = 40, ROAD_TIMEOUT = 12000;
+  var ROAD_R = AREA + 40, ROAD_REUSE = 40, ROAD_TIMEOUT = 20000;
   var OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
   function llDist(a, b) { return Math.hypot((a.lon - b.lon) * 111320 * Math.cos(a.lat * Math.PI / 180), (a.lat - b.lat) * MY); }
   function roadsNear(ll) { return roads && llDist(roads.c, ll) < ROAD_REUSE; }
   function fetchRoads(c) {
     // big car roads, stairs, private and no-foot ways are left out so beans never lead onto them
-    var q = '[out:json][timeout:10];way(around:' + ROAD_R + ',' + c.lat.toFixed(6) + ',' + c.lon.toFixed(6) + ')["highway"]' +
+    var q = '[out:json][timeout:20];way(around:' + ROAD_R + ',' + c.lat.toFixed(6) + ',' + c.lon.toFixed(6) + ')["highway"]' +
       '["highway"!~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|steps|construction|proposed|raceway|bus_guideway|corridor|elevator|escape|platform)$"]' +
       '["access"!~"^(private|no)$"]["foot"!="no"]["area"!="yes"];out geom;';
     if (!window.fetch) return Promise.reject(new Error('浏览器不支持 fetch'));
-    var deadline = Date.now() + ROAD_TIMEOUT;
-    function attempt(i) {
-      if (i >= OVERPASS.length || Date.now() >= deadline) return Promise.reject(new Error('街道数据服务都连不上'));
-      var ctl = window.AbortController ? new AbortController() : null;
-      var timer = setTimeout(function () { if (ctl) ctl.abort(); }, Math.max(1000, Math.min(7000, deadline - Date.now())));
-      return fetch(OVERPASS[i], { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctl ? ctl.signal : undefined,
-                                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
-        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(function (data) {
-          clearTimeout(timer); dbg.roadSrc = OVERPASS[i].split('/')[2];
-          return (data.elements || []).filter(function (e) { return e.type === 'way' && e.geometry && e.geometry.length > 1; })
-            .map(function (e) { return { hw: e.tags && e.tags.highway, pts: e.geometry }; });
-        })
-        .catch(function (e) { clearTimeout(timer); logErr('街道 ' + OVERPASS[i].split('/')[2] + ': ' + (e.name === 'AbortError' ? '超时' : e.message)); return attempt(i + 1); });
-    }
-    return attempt(0);
+    // ask every server at once and take the first good answer; a slow or blocked one no longer eats the others' time
+    return new Promise(function (resolve, reject) {
+      var t0 = Date.now(), left = OVERPASS.length, done = false, ctls = [];
+      function finish() { done = true; ctls.forEach(function (c) { if (c) try { c.abort(); } catch (e) {} }); }
+      var timer = setTimeout(function () { if (!done) { finish(); reject(new Error('街道数据服务都连不上（' + ROAD_TIMEOUT / 1000 + ' 秒超时）')); } }, ROAD_TIMEOUT);
+      OVERPASS.forEach(function (url) {
+        var host = url.split('/')[2], ctl = window.AbortController ? new AbortController() : null;
+        ctls.push(ctl);
+        fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), signal: ctl ? ctl.signal : undefined,
+                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+          .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+          .then(function (data) {
+            if (done) return;
+            clearTimeout(timer); finish(); dbg.roadSrc = host + ' ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s';
+            resolve((data.elements || []).filter(function (e) { return e.type === 'way' && e.geometry && e.geometry.length > 1; })
+              .map(function (e) { return { hw: e.tags && e.tags.highway, pts: e.geometry }; }));
+          })
+          .catch(function (e) {
+            if (done) return;
+            logErr('街道 ' + host + ': ' + e.message + '（' + ((Date.now() - t0) / 1000).toFixed(1) + ' s）');
+            if (--left === 0) { clearTimeout(timer); done = true; reject(new Error('街道数据服务都连不上')); }
+          });
+      });
+    });
   }
   function loadRoads() {
     state = 'mapping'; showOverlay('mapping');
@@ -460,8 +468,9 @@ body {
     else if (ovKind === 'locating' || ovKind === 'error' || ovKind === 'mapping') { mapToken++; stopGeo(); state = 'menu'; showOverlay('menu'); }
     else if (ovKind === 'clear') { level++; begin(); }
     else { level = 1; score = 0; lives = 3; begin(); }
+    if (state !== 'menu') wake();
   });
-  el.ovB2.addEventListener('click', function () { if (ovKind === 'locating') startLenient(); else if (ovKind === 'mapping') skipRoads(); else startSim(); });
+  el.ovB2.addEventListener('click', function () { if (ovKind === 'locating') startLenient(); else if (ovKind === 'mapping') skipRoads(); else startSim(); wake(); });
 
   /* ---------- game rules ---------- */
   function saveBest() { if (score > best) { best = score; try { localStorage.setItem('ghostbean-best', String(best)); } catch (e) {} } }
