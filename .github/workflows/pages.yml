@@ -32,7 +32,7 @@ jobs:
       - uses: actions/cache@v4
         id: cache
         with:
-          path: streets
+          path: streets.tar
           key: streets-${{ steps.key.outputs.month }}-${{ hashFiles('tools/cities.json', 'tools/build_streets.py') }}
       - name: Build street tiles
         if: steps.cache.outputs.cache-hit != 'true'
@@ -48,11 +48,13 @@ jobs:
               -o "$RUNNER_TEMP/china.osm.pbf" https://download.geofabrik.de/asia/china-latest.osm.pbf
             free -m | head -2; df -h "$RUNNER_TEMP" | tail -1
             python3 tools/build_streets.py "$RUNNER_TEMP/china.osm.pbf" tools/cities.json streets
+            # one file for the cache: actions/cache overflows its stack on a manifest of 350k paths
+            tar -cf streets.tar streets && rm -rf streets && ls -l streets.tar
           } 2>&1 | tee "$RUNNER_TEMP/build.log"
       - name: Assemble site
         run: |
           mkdir _site && cp index.html _site/
-          if [ -d streets ]; then cp -r streets _site/streets; fi
+          if [ -f streets.tar ]; then tar -xf streets.tar -C _site; fi
           du -sh _site
       - uses: actions/upload-pages-artifact@v3
         with:

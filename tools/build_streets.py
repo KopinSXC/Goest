@@ -24,7 +24,9 @@ import sys
 import time
 
 TILE = 50               # tiles are 1/TILE degree (about 2.2 km north-south); keep in sync with index.html
-SIZE_LIMIT = 900e6      # bytes of tiles allowed for the whole-country build
+SIZE_LIMIT = 900e6      # bytes the published tiles may take, counting per-file overhead (Pages sites stay under 1 GB)
+FILE_OVERHEAD = 1024    # tar header plus padding per file; 350k tiny files cost ~350 MB on their own
+MIN_WAYS = 15           # outside the city boxes, emptier tiles are countryside where the game falls back to a grid anyway
 SIMPLIFY = 1.5e-5       # degrees (about 1.5 m) of shape detail dropped per way
 # keep in sync with fetchOverpass() in index.html; tracks are farm roads and add a lot of size
 EXCLUDE = {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "steps",
@@ -127,6 +129,10 @@ def collect(ways):
     return tiles, n, size
 
 
+def cost(items):
+    return sum(len(i) + 1 for i in items) + FILE_OVERHEAD
+
+
 def trim(tiles, boxes, limit):
     """Keep tiles inside the city boxes, then the busiest tiles elsewhere, up to limit bytes."""
     def in_city(key):
@@ -135,12 +141,15 @@ def trim(tiles, boxes, limit):
     order = sorted(tiles, key=lambda k: (not in_city(k), -len(tiles[k])))
     kept, total, last = {}, 0, 0
     for k in order:
-        size = sum(len(i) + 1 for i in tiles[k])
+        city = in_city(k)
+        if not city and len(tiles[k]) < MIN_WAYS:
+            break   # sorted busiest first, so everything after this is emptier still
+        size = cost(tiles[k])
         if total + size > limit:
             continue
         kept[k] = tiles[k]
         total += size
-        if not in_city(k):
+        if not city:
             last = len(tiles[k])
     return kept, total, last
 
@@ -172,7 +181,8 @@ def main():
 
     log("whole country")
     tiles, n, size = collect(stream_ways(hw))
-    log(f"whole country: {n} ways, {len(tiles)} tiles, {size / 1e6:.0f} MB")
+    size += FILE_OVERHEAD * len(tiles)
+    log(f"whole country: {n} ways, {len(tiles)} tiles, {size / 1e6:.0f} MB with file overhead")
     if size > SIZE_LIMIT:
         with open(cities_path) as f:
             boxes = [city_box(c) for c in json.load(f)]
