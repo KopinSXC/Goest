@@ -273,7 +273,7 @@ body {
   // street tiles published with the site (tools/build_streets.py); same origin, so it works where Overpass is blocked
   // coverage.json lists the whole degrees that have streets ({cells}) or one [south, west, north, east] box per city ({boxes});
   // inside the covered area a missing tile just means no streets there
-  var TILE = 100, TILE_TIMEOUT = 8000, coverage = null;
+  var TILE = 50, TILE_TIMEOUT = 8000, coverage = null;   // TILE must match tools/build_streets.py
   function getJSON(url) {
     var ctl = window.AbortController ? new AbortController() : null, timer = setTimeout(function () { if (ctl) ctl.abort(); }, TILE_TIMEOUT);
     return fetch(url, { signal: ctl ? ctl.signal : undefined })

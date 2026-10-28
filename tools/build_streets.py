@@ -2,14 +2,14 @@
 
     python3 tools/build_streets.py china-latest.osm.pbf tools/cities.json streets
 
-Tries the whole country first. If that is larger than SIZE_LIMIT (GitHub Pages sites
-must stay under 1 GB) it falls back to the boxes in cities.json. Needs osmium-tool.
+Builds the whole country. If that is larger than SIZE_LIMIT (GitHub Pages sites must
+stay under 1 GB) it keeps the boxes in cities.json plus the densest tiles elsewhere
+(towns before countryside) until the limit is reached. Needs osmium-tool.
 Runs inside GitHub Actions; the output goes into the Actions cache and the Pages
 artifact, never into the repository.
 
 Output:
-  streets/coverage.json      {"cells": ["lat_lon", ...]}  whole degrees that have streets, or
-                             {"boxes": [[south, west, north, east], ...]}  one box per city
+  streets/coverage.json      {"cells": ["lat_lon", ...]}  whole degrees that have streets
   streets/<lat>_<lon>.json   tiles of 1/TILE degree, only where there are streets:
                              {"w": [[way id, highway, [lat0, lon0, dlat1, dlon1, ...]], ...]}
                              coordinates are integers in 1e-5 degrees, after the first
@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 
-TILE = 100              # tiles are 1/TILE degree (about 1.1 km north-south)
+TILE = 50               # tiles are 1/TILE degree (about 2.2 km north-south); keep in sync with index.html
 SIZE_LIMIT = 900e6      # bytes of tiles allowed for the whole-country build
 SIMPLIFY = 1.5e-5       # degrees (about 1.5 m) of shape detail dropped per way
 # keep in sync with fetchOverpass() in index.html; tracks are farm roads and add a lot of size
@@ -78,7 +78,7 @@ def simplify(pts, tol=SIMPLIFY):
 def tiles_of_way(pts):
     keys = set()
     for (a, b), (c, d) in zip(pts, pts[1:] or pts):
-        n = max(1, math.ceil(max(abs(c - a), abs(d - b)) / 0.001))
+        n = max(1, math.ceil(max(abs(c - a), abs(d - b)) / 0.002))
         for k in range(n + 1):
             keys.add((math.floor((a + (c - a) * k / n) * TILE), math.floor((b + (d - b) * k / n) * TILE)))
     return keys
@@ -112,12 +112,10 @@ def stream_ways(hw):
         raise RuntimeError(f"osmium export exited with {p.returncode}")
 
 
-def collect(ways, inside=None):
-    """Group encoded ways by tile; inside(pts) limits which ways are kept."""
+def collect(ways):
+    """Group encoded ways by tile."""
     tiles, n, size = {}, 0, 0
     for wid, hw, pts in ways:
-        if inside and not inside(pts):
-            continue
         pts = simplify(pts)
         item = json.dumps([wid, hw, encode(pts)], separators=(",", ":"))
         for key in tiles_of_way(pts):
@@ -127,6 +125,24 @@ def collect(ways, inside=None):
         if n % 500000 == 0:
             log(f"{n} ways, {len(tiles)} tiles, {size / 1e6:.0f} MB so far")
     return tiles, n, size
+
+
+def trim(tiles, boxes, limit):
+    """Keep tiles inside the city boxes, then the busiest tiles elsewhere, up to limit bytes."""
+    def in_city(key):
+        lat, lon = (key[0] + .5) / TILE, (key[1] + .5) / TILE
+        return any(b[0] <= lat <= b[2] and b[1] <= lon <= b[3] for b in boxes)
+    order = sorted(tiles, key=lambda k: (not in_city(k), -len(tiles[k])))
+    kept, total, last = {}, 0, 0
+    for k in order:
+        size = sum(len(i) + 1 for i in tiles[k])
+        if total + size > limit:
+            continue
+        kept[k] = tiles[k]
+        total += size
+        if not in_city(k):
+            last = len(tiles[k])
+    return kept, total, last
 
 
 def write(tiles, coverage, out):
@@ -157,23 +173,16 @@ def main():
     log("whole country")
     tiles, n, size = collect(stream_ways(hw))
     log(f"whole country: {n} ways, {len(tiles)} tiles, {size / 1e6:.0f} MB")
-    if size <= SIZE_LIMIT:
-        cells = sorted({f"{math.floor(a / TILE)}_{math.floor(b / TILE)}" for a, b in tiles})
-        coverage = {"cells": cells}
-    else:
-        log(f"over the {SIZE_LIMIT / 1e6:.0f} MB limit, keeping only the cities in {cities_path}")
+    if size > SIZE_LIMIT:
         with open(cities_path) as f:
             boxes = [city_box(c) for c in json.load(f)]
-
-        def inside(pts):
-            la = [p[0] for p in pts]
-            lo = [p[1] for p in pts]
-            return any(min(la) <= b[2] and max(la) >= b[0] and min(lo) <= b[3] and max(lo) >= b[1] for b in boxes)
-        tiles = None
-        tiles, n, size = collect(stream_ways(hw), inside)
-        coverage = {"boxes": boxes}
-    written = write(tiles, coverage, out)
-    log(f"done: {'cells' if 'cells' in coverage else 'cities'} mode, {n} ways, {len(tiles)} tiles, {written / 1e6:.0f} MB")
+        before = len(tiles)
+        tiles, size, last = trim(tiles, boxes, SIZE_LIMIT)
+        log(f"trimmed to {SIZE_LIMIT / 1e6:.0f} MB: kept {len(tiles)} of {before} tiles, "
+            f"outside the cities down to tiles with {last} ways")
+    cells = sorted({f"{math.floor(a / TILE)}_{math.floor(b / TILE)}" for a, b in tiles})
+    written = write(tiles, {"cells": cells}, out)
+    log(f"done: {len(tiles)} tiles in {len(cells)} cells, {written / 1e6:.0f} MB")
 
 
 if __name__ == "__main__":
