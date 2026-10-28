@@ -188,15 +188,16 @@ body {
 
   /* ---------- level setup ---------- */
   function rnd(a, b) { return a + Math.random() * (b - a); }
-  function genBeans() {
-    beans = [];
+  function gridPoints() {
+    var pts = [];
     for (var gx = -AREA; gx <= AREA; gx += SPACING) for (var gy = -AREA; gy <= AREA; gy += SPACING) {
       var x = gx + rnd(-8, 8), y = gy + rnd(-8, 8);
       if (Math.hypot(x, y) > AREA || Math.hypot(x, y) < 12) continue;
-      beans.push({ x: x, y: y, on: true, power: false });
+      pts.push({ x: x, y: y, on: true, power: false });
     }
-    pickPower();
+    return pts;
   }
+  function genBeans() { beans = gridPoints(); pickPower(); }
   function pickPower() {
     var far = beans.filter(function (b) { return Math.hypot(b.x, b.y) > 75; });
     // small street maps may have few beans that far out; fall back to the outer third
@@ -353,12 +354,28 @@ body {
         s -= sl;
       }
     }
+    if (!beans.length) { streets = null; return false; }
+    // sparse map data: keep the street rows and fill the blank areas, away from every street, with grid beans
+    var mixed = beans.length < STREET_ENOUGH;
+    if (mixed) gridPoints().forEach(function (g) {
+      for (var a = 0; a < streets.length; a++) for (var w2 = streets[a].pts, b = 1; b < w2.length; b++)
+        if (segDist(g.x, g.y, w2[b - 1], w2[b]) < FILL_GAP) return;
+      for (var j = 0; j < beans.length; j++) if (Math.hypot(beans[j].x - g.x, beans[j].y - g.y) < FILL_GAP) return;
+      beans.push(g);
+    });
     if (beans.length < 12) { streets = null; return false; }
-    pickPower(); return true;
+    pickPower(); return mixed ? 'mixed' : 'street';
+  }
+  // with this many street beans the streets carry the level alone; fewer, and the gaps get grid beans at least FILL_GAP from a street
+  var STREET_ENOUGH = 30, FILL_GAP = 25;
+  function segDist(px, py, a, b) {
+    var vx = b.x - a.x, vy = b.y - a.y, l2 = vx * vx + vy * vy, u = l2 ? Math.max(0, Math.min(1, ((px - a.x) * vx + (py - a.y) * vy) / l2)) : 0;
+    return Math.hypot(a.x + vx * u - px, a.y + vy * u - py);
   }
   function placeBeans() {
     layout = 'grid'; streets = null;
-    if (mode === 'gps' && roads && roads.ways.length && streetBeans()) { layout = 'street'; return; }
+    var got = mode === 'gps' && roads && roads.ways.length && streetBeans();
+    if (got) { layout = got; if (got === 'mixed') toast('附近街道较少，空白处用网格补了豆'); return; }
     genBeans();
     if (mode === 'gps' && roads) toast(roads.err === '已跳过' ? '已跳过街道，使用普通布局' : roads.err ? '没读到街道数据，改用普通布局' : '附近可走的街道太少，改用普通布局');
   }
@@ -806,7 +823,7 @@ body {
     L.push('最近的鬼 ' + (mg ? f(md, 1) + ' m（类型 ' + mg.type + (mg.fright > 0 ? '，虚弱' : '') + '）' : '—') + ' · 共 ' + ghosts.length + ' 只');
     if (state === 'play' && mode === 'gps') L.push('吃豆半径 ' + f(Math.max(10, Math.min(16, acc * .6)), 1) + ' m · 被抓半径 ' + f(Math.max(6, Math.min(12, acc * .5)), 1) + ' m');
     L.push('防熄屏 ' + dbg.wake + ' · 震动 ' + ('vibrate' in navigator ? '支持' : '不支持') + ' · https ' + (window.isSecureContext ? '是' : '否'));
-    L.push('豆子布局 ' + (layout === 'street' ? '沿街道' : '网格') + (roads ? ' · 街道 ' + roads.ways.length + ' 条' + (roads.err ? '（' + roads.err + '）' : ' · 来源 ' + (dbg.roadSrc || '—')) : ''));
+    L.push('豆子布局 ' + ({ street: '沿街道', mixed: '混合（街道+网格）' }[layout] || '网格') + (roads ? ' · 街道 ' + roads.ways.length + ' 条' + (roads.err ? '（' + roads.err + '）' : ' · 来源 ' + (dbg.roadSrc || '—')) : ''));
     L.push('定位错误 ' + dbg.geoErr);
     for (i = 0; i < dbg.errs.length; i++) L.push('! ' + dbg.errs[i]);
     dbgEl.textContent = L.join('\n');
