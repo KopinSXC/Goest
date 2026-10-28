@@ -23,6 +23,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Cache key
@@ -36,9 +37,13 @@ jobs:
       - name: Build street tiles
         if: steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
+        timeout-minutes: 45
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/china.osm.pbf" https://download.geofabrik.de/asia/china-latest.osm.pbf
+          echo "download start $(date -u +%T)"
+          curl -fsSL --retry 3 --max-time 1200 -w 'downloaded %{size_download} bytes in %{time_total} s\n' \
+            -o "$RUNNER_TEMP/china.osm.pbf" https://download.geofabrik.de/asia/china-latest.osm.pbf
+          free -m; df -h "$RUNNER_TEMP" | tail -1
           python3 tools/build_streets.py "$RUNNER_TEMP/china.osm.pbf" tools/cities.json streets
           rm -f "$RUNNER_TEMP/china.osm.pbf"
       - name: Assemble site

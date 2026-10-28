@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 TILE = 100  # tiles are 1/TILE degree (about 1.1 km north-south)
 # keep in sync with fetchOverpass() in index.html
@@ -56,24 +57,33 @@ def encode(pts):
     return out
 
 
+T0 = time.time()
+
+
+def log(msg):
+    print(f"[{time.time() - T0:6.0f}s] {msg}", flush=True)
+
+
 def run(*args):
     subprocess.run(args, check=True)
 
 
-def extract(pbf, boxes, work):
-    """Return one GeoJSON-lines file of street linestrings per city box."""
+def extract(pbf, cities, boxes, work):
+    """Return one GeoJSON-lines file of street linestrings per city box.
+
+    Cities are cut one at a time: a single multi-extract pass over the whole
+    country held too much in memory and the runner was shut down."""
     hw = os.path.join(work, "highways.osm.pbf")
+    log("filtering highways")
     run("osmium", "tags-filter", "-O", "-o", hw, pbf, "w/highway")
-    cfg = {"directory": work,
-           "extracts": [{"output": f"city{i}.osm.pbf", "bbox": [b[1], b[0], b[3], b[2]]} for i, b in enumerate(boxes)]}
-    with open(os.path.join(work, "extracts.json"), "w") as f:
-        json.dump(cfg, f)
-    run("osmium", "extract", "-O", "-c", os.path.join(work, "extracts.json"), hw)
+    log(f"highways: {os.path.getsize(hw) / 1e6:.0f} MB")
     files = []
-    for i in range(len(boxes)):
-        out = os.path.join(work, f"city{i}.geojsonseq")
-        run("osmium", "export", "-O", "-f", "geojsonseq", "--geometry-types=linestring", "-a", "id",
-            "-o", out, os.path.join(work, f"city{i}.osm.pbf"))
+    for i, (c, b) in enumerate(zip(cities, boxes)):
+        city, out = os.path.join(work, f"city{i}.osm.pbf"), os.path.join(work, f"city{i}.geojsonseq")
+        run("osmium", "extract", "-O", "-s", "complete_ways", "-b", f"{b[1]},{b[0]},{b[3]},{b[2]}", "-o", city, hw)
+        run("osmium", "export", "-O", "-f", "geojsonseq", "--geometry-types=linestring", "-a", "id", "-o", out, city)
+        os.remove(city)
+        log(f"{c['name']}: {os.path.getsize(out) / 1e6:.1f} MB")
         files.append(out)
     return files
 
@@ -125,7 +135,8 @@ def main():
         cities = json.load(f)
     boxes = [city_box(c) for c in cities]
     with tempfile.TemporaryDirectory() as work:
-        files = extract(pbf, boxes, work)
+        files = extract(pbf, cities, boxes, work)
+        log("building tiles")
         handles = [open(p) for p in files]
         try:
             per_city, ntiles, size = build(handles, boxes, out)
