@@ -271,7 +271,8 @@ body {
     });
   }
   // street tiles published with the site (tools/build_streets.py); same origin, so it works where Overpass is blocked
-  // coverage.json lists one [south, west, north, east] box per city; inside a box a missing tile just means no streets
+  // coverage.json lists the whole degrees that have streets ({cells}) or one [south, west, north, east] box per city ({boxes});
+  // inside the covered area a missing tile just means no streets there
   var TILE = 100, TILE_TIMEOUT = 8000, coverage = null;
   function getJSON(url) {
     var ctl = window.AbortController ? new AbortController() : null, timer = setTimeout(function () { if (ctl) ctl.abort(); }, TILE_TIMEOUT);
@@ -287,7 +288,9 @@ body {
     return (coverage ? Promise.resolve(coverage) : getJSON('streets/coverage.json')).then(function (cov) {
       if (!cov) throw new Error('本站没有街道数据');
       coverage = cov;
-      if (!cov.some(function (b) { return c.lat >= b[0] && c.lon >= b[1] && c.lat <= b[2] && c.lon <= b[3]; })) throw new Error('本站还没覆盖这座城市');
+      var covered = cov.cells ? cov.cells.indexOf(Math.floor(c.lat) + '_' + Math.floor(c.lon)) >= 0
+        : (cov.boxes || []).some(function (b) { return c.lat >= b[0] && c.lon >= b[1] && c.lat <= b[2] && c.lon <= b[3]; });
+      if (!covered) throw new Error('本站还没覆盖这里');
       return Promise.all(Object.keys(keys).map(function (k) { return getJSON('streets/' + k + '.json'); }));
     }).then(function (tiles) {
       var seen = {}, ways = [];

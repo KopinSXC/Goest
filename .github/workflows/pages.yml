@@ -23,7 +23,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Cache key
@@ -37,15 +37,18 @@ jobs:
       - name: Build street tiles
         if: steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
-        timeout-minutes: 45
+        timeout-minutes: 90
+        # the log is copied to build.log and printed again at the very end, after the long file listing
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool
-          echo "download start $(date -u +%T)"
-          curl -fsSL --retry 3 --max-time 1200 -w 'downloaded %{size_download} bytes in %{time_total} s\n' \
-            -o "$RUNNER_TEMP/china.osm.pbf" https://download.geofabrik.de/asia/china-latest.osm.pbf
-          free -m; df -h "$RUNNER_TEMP" | tail -1
-          python3 tools/build_streets.py "$RUNNER_TEMP/china.osm.pbf" tools/cities.json streets
-          rm -f "$RUNNER_TEMP/china.osm.pbf"
+          set -o pipefail
+          {
+            sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool >/dev/null
+            echo "download start $(date -u +%T)"
+            curl -fsSL --retry 3 --max-time 1800 -w 'downloaded %{size_download} bytes in %{time_total} s\n' \
+              -o "$RUNNER_TEMP/china.osm.pbf" https://download.geofabrik.de/asia/china-latest.osm.pbf
+            free -m | head -2; df -h "$RUNNER_TEMP" | tail -1
+            python3 tools/build_streets.py "$RUNNER_TEMP/china.osm.pbf" tools/cities.json streets
+          } 2>&1 | tee "$RUNNER_TEMP/build.log"
       - name: Assemble site
         run: |
           mkdir _site && cp index.html _site/
@@ -55,6 +58,12 @@ jobs:
         with:
           path: _site
           retention-days: 1
+      - name: Summary
+        if: always()
+        run: |
+          echo "cache hit: ${{ steps.cache.outputs.cache-hit }}"
+          tail -40 "$RUNNER_TEMP/build.log" 2>/dev/null || echo "no build log"
+          du -sh _site 2>/dev/null; ls _site/streets 2>/dev/null | wc -l
 
   deploy:
     needs: build

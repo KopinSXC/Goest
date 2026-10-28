@@ -57,10 +57,11 @@
 
 ## 4.1 当前部署方式（GitHub Actions）
 
-- `.github/workflows/pages.yml`：推送 main、手动运行、每月 2 日定时运行。从 Geofabrik 下载全中国的 OSM 数据（约 1.4 GB），用 osmium 切出 `tools/cities.json` 里每个城市的方框，再由 `tools/build_streets.py` 过滤成可步行道路，切成 0.01° 的小块，和 `index.html` 一起发布到 Pages。
+- `.github/workflows/pages.yml`：推送 main、手动运行、每月 2 日定时运行。从 Geofabrik 下载全中国的 OSM 数据（约 1.4 GB），`tools/build_streets.py` 过滤出可步行道路（另外去掉农田小路 track、停车场通道和私人车道），把形状简化到约 1.5 m 精度，切成 0.01° 的小块，和 `index.html` 一起发布到 Pages。
+- 先按全国生成；如果超过 900 MB（Pages 网站上限 1 GB，免费账户），自动改为只生成 `tools/cities.json` 里的城市方框。
 - 切片放在 Actions 缓存里（按月和脚本内容生成缓存键），**不提交到仓库**。平时推送直接用缓存，不重新下载。
-- 游戏先读 `streets/coverage.json` 判断是否在覆盖城市内：在就读本站切片；不在才问国外的 Overpass 服务器（国内手机基本连不上，2026-10 实测三个都超时）；都不行用网格布局。
-- 增减城市：改 `tools/cities.json`（`half_km` 是方框半边长，公里），推送后自动重建。偏远省份（新疆、西藏、青海、宁夏、内蒙古、甘肃）暂未加入。
+- 游戏先读 `streets/coverage.json`：全国模式是有数据的整度格子列表，城市模式是城市方框。在覆盖范围内读本站切片；不在才问国外的 Overpass 服务器（国内手机基本连不上，2026-10 实测三个都超时）；都不行用网格布局。
+- 构建日志在最后的 Summary 步骤里会再打印一遍（前面有很长的文件列表）。
 - 需要的设置：Settings → Pages → Source 选 "GitHub Actions"。
 
 ## 5. 已知缺陷
