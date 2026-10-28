@@ -1,0 +1,47 @@
+# Publishes the site to GitHub Pages together with street tiles built on the fly.
+# The tiles exist only in the Pages artifact; they are never committed to the repo.
+# Needs Settings > Pages > Source set to "GitHub Actions" and the repository secret
+# STREETS_CENTER ("lat,lon", city level is enough).
+name: Deploy site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy site files
+        run: mkdir _site && cp index.html _site/
+      - name: Build street tiles
+        continue-on-error: true
+        env:
+          STREETS_CENTER: ${{ secrets.STREETS_CENTER }}
+          STREETS_HALF_KM: "5"
+        run: python3 tools/build_streets.py _site/streets
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

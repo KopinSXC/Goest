@@ -239,7 +239,7 @@ body {
   var OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
   function llDist(a, b) { return Math.hypot((a.lon - b.lon) * 111320 * Math.cos(a.lat * Math.PI / 180), (a.lat - b.lat) * MY); }
   function roadsNear(ll) { return roads && llDist(roads.c, ll) < ROAD_REUSE; }
-  function fetchRoads(c) {
+  function fetchOverpass(c) {
     // big car roads, stairs, private and no-foot ways are left out so beans never lead onto them
     var q = '[out:json][timeout:20];way(around:' + ROAD_R + ',' + c.lat.toFixed(6) + ',' + c.lon.toFixed(6) + ')["highway"]' +
       '["highway"!~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|steps|construction|proposed|raceway|bus_guideway|corridor|elevator|escape|platform)$"]' +
@@ -270,6 +270,42 @@ body {
       });
     });
   }
+  // street tiles published with the site (tools/build_streets.py); same origin, so it works where Overpass is blocked
+  var TILE = 100, TILE_TIMEOUT = 8000;
+  function fetchLocalRoads(c) {
+    var t0 = Date.now(), dLat = ROAD_R / MY, dLon = ROAD_R / (111320 * Math.cos(c.lat * Math.PI / 180)), keys = {};
+    [-1, 1].forEach(function (a) { [-1, 1].forEach(function (b) {
+      keys[Math.floor((c.lat + a * dLat) * TILE) + '_' + Math.floor((c.lon + b * dLon) * TILE)] = 1;
+    }); });
+    return Promise.all(Object.keys(keys).map(function (k) {
+      var ctl = window.AbortController ? new AbortController() : null, timer = setTimeout(function () { if (ctl) ctl.abort(); }, TILE_TIMEOUT);
+      return fetch('streets/' + k + '.json', { signal: ctl ? ctl.signal : undefined })
+        .then(function (r) { clearTimeout(timer); return r.ok ? r.json() : null; })
+        .catch(function () { clearTimeout(timer); return null; });
+    })).then(function (tiles) {
+      if (!tiles.some(Boolean)) throw new Error('本站没有这片区域的街道');
+      var seen = {}, ways = [];
+      tiles.forEach(function (t) { (t && t.w || []).forEach(function (w) {
+        if (seen[w[0]]) return; seen[w[0]] = 1;
+        var pts = [], near = false;
+        for (var i = 0; i < w[2].length; i += 2) pts.push({ lat: w[2][i], lon: w[2][i + 1] });
+        // keep only ways that pass within ROAD_R of the start, tiles are much bigger than the play area
+        for (i = 0; i < pts.length && !near; i++) {
+          var a = pts[i], b = pts[i + 1] || a;
+          var ax = (a.lon - c.lon) / dLon * ROAD_R, ay = (a.lat - c.lat) / dLat * ROAD_R, bx = (b.lon - c.lon) / dLon * ROAD_R, by = (b.lat - c.lat) / dLat * ROAD_R;
+          var vx = bx - ax, vy = by - ay, l2 = vx * vx + vy * vy, u = l2 ? Math.max(0, Math.min(1, -(ax * vx + ay * vy) / l2)) : 0;
+          near = Math.hypot(ax + vx * u, ay + vy * u) <= ROAD_R;
+        }
+        if (near) ways.push({ hw: w[1], pts: pts });
+      }); });
+      dbg.roadSrc = '本站 ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s';
+      return ways;
+    });
+  }
+  function fetchRoads(c) {
+    if (!window.fetch) return Promise.reject(new Error('浏览器不支持 fetch'));
+    return fetchLocalRoads(c).catch(function (e) { logErr('街道 ' + e.message + '，改问国外服务器'); return fetchOverpass(c); });
+  }
   function loadRoads() {
     state = 'mapping'; showOverlay('mapping');
     var tok = ++mapToken, c = { lat: lastLL.lat, lon: lastLL.lon };
@@ -277,16 +313,20 @@ body {
       .then(function (r) { if (tok !== mapToken || state !== 'mapping') return; roads = r; begin(); });
   }
   function skipRoads() { if (!lastLL) return; mapToken++; roads = { c: { lat: lastLL.lat, lon: lastLL.lon }, ways: [], err: '已跳过' }; begin(); }
+  // length of segment a-b that lies inside the circle of radius R around the start (OSM segments can be very long)
+  function insideLen(a, b, R) {
+    var vx = b.x - a.x, vy = b.y - a.y, A = vx * vx + vy * vy, B = a.x * vx + a.y * vy, Cc = a.x * a.x + a.y * a.y - R * R, D = B * B - A * Cc;
+    if (!A || D <= 0) return 0;
+    var t0 = Math.max(0, (-B - Math.sqrt(D)) / A), t1 = Math.min(1, (-B + Math.sqrt(D)) / A);
+    return t1 > t0 ? (t1 - t0) * Math.sqrt(A) : 0;
+  }
   function streetBeans() {
     var LEN = 0, i, k, w;
     streets = roads.ways.map(function (w) {
       return { hw: w.hw, pts: w.pts.map(function (p) { return { x: (p.lon - origin.lon) * MX, y: (p.lat - origin.lat) * MY }; }) };
     });
     // total walkable length inside the play area decides the spacing, so a dense block does not get hundreds of beans
-    for (i = 0; i < streets.length; i++) for (w = streets[i].pts, k = 1; k < w.length; k++) {
-      var mx = (w[k].x + w[k - 1].x) / 2, my = (w[k].y + w[k - 1].y) / 2;
-      if (Math.hypot(mx, my) <= AREA) LEN += Math.hypot(w[k].x - w[k - 1].x, w[k].y - w[k - 1].y);
-    }
+    for (i = 0; i < streets.length; i++) for (w = streets[i].pts, k = 1; k < w.length; k++) LEN += insideLen(w[k - 1], w[k], AREA);
     var SP = Math.max(14, LEN / 120), MIN = SP * .65;
     beans = [];
     function put(x, y) {
