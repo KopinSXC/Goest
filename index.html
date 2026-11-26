@@ -86,6 +86,15 @@ body {
 /* debug panel: sits above the overlay, never catches taps so demo-mode clicks still reach the map */
 .dbgBtn { font: inherit; font-size: 12px; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
 .dbgBtn[aria-pressed="true"] { color: var(--fg); border-color: var(--route); }
+.snd { position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 6; max-width: 420px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 2px; }
+.snd h2 { margin: 0 0 6px; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
+.snd label { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
+.snd label.sub { padding-left: 14px; color: var(--muted); }
+.snd input[type=checkbox] { width: 20px; height: 20px; accent-color: var(--route); }
+.snd input[type=range] { flex: 1; max-width: 180px; accent-color: var(--route); }
+.snd output { width: 3em; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.snd .btn { margin-top: 8px; }
+.snd p { margin: 6px 0 0; font-size: 12px; color: var(--muted); }
 .dbg { position: absolute; left: 8px; top: 8px; z-index: 5; max-width: calc(100% - 16px); margin: 0; padding: 8px 10px; border-radius: 8px; background: rgba(0, 0, 0, .72); color: #cfe3d4; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-all; pointer-events: none; }
 </style>
 
@@ -102,6 +111,17 @@ body {
     <div class="toast" id="toast"></div>
     <div class="power"><i id="powerFill"></i></div>
     <pre class="dbg" id="dbg" hidden></pre>
+    <div class="snd" id="snd" hidden>
+      <h2>声音设置 <button class="dbgBtn" id="sndClose" type="button">关闭</button></h2>
+      <label>声音<input type="checkbox" id="sndOn"></label>
+      <label>音量<input type="range" id="sndVol" min="0" max="100" step="5"><output id="sndVolV"></output></label>
+      <label class="sub">鬼靠近的心跳声<input type="checkbox" data-k="near"></label>
+      <label class="sub">吃豆<input type="checkbox" data-k="bean"></label>
+      <label class="sub">大力豆和吃鬼<input type="checkbox" data-k="power"></label>
+      <label class="sub">被抓和过关<input type="checkbox" data-k="alert"></label>
+      <button class="btn alt" id="sndTest" type="button">试听心跳声</button>
+      <p>手机静音时不会出声，这是系统的设置，游戏不会绕过它。</p>
+    </div>
     <div class="overlay" id="overlay">
       <div class="card">
         <p class="eyebrow" id="ovEyebrow">GPS 定位玩法</p>
@@ -190,8 +210,16 @@ body {
 
   /* ---------- sound: synthesized with Web Audio, so it also works on iPhones, which cannot vibrate ---------- */
   // browsers only start audio from a tap, so audioInit() runs in the button and map tap handlers
-  var audio = { ctx: null, on: true, err: '' }, lastBeat = 0;
-  try { audio.on = localStorage.getItem('ghostbean-sound') !== '0'; } catch (e) {}
+  // settings: master switch, volume 0-100 (70 = the original loudness) and one switch per kind of sound
+  var audio = { ctx: null, out: null, on: true, vol: 70, kinds: { near: true, bean: true, power: true, alert: true }, err: '' }, lastBeat = 0;
+  var SFX_KIND = { near: 'near', bean: 'bean', power: 'power', eatGhost: 'power', hit: 'alert', clear: 'alert' };
+  try {
+    var saved = JSON.parse(localStorage.getItem('ghostbean-sound-v2') || 'null');
+    if (saved) { audio.on = saved.on !== false; audio.vol = +saved.vol >= 0 ? +saved.vol : 70; for (var sk in audio.kinds) if (saved.kinds && sk in saved.kinds) audio.kinds[sk] = !!saved.kinds[sk]; }
+    else audio.on = localStorage.getItem('ghostbean-sound') !== '0';   // the earlier plain on/off setting
+  } catch (e) {}
+  function saveSound() { try { localStorage.setItem('ghostbean-sound-v2', JSON.stringify({ on: audio.on, vol: audio.vol, kinds: audio.kinds })); } catch (e) {} }
+  function setVolume() { if (audio.out) audio.out.gain.value = audio.vol / 70; }
   function audioInit() {
     if (!audio.on) return;
     try {
@@ -199,6 +227,7 @@ body {
         var AC = window.AudioContext || window.webkitAudioContext;
         if (!AC) { audio.err = '不支持'; return; }
         audio.ctx = new AC();
+        audio.out = audio.ctx.createGain(); audio.out.connect(audio.ctx.destination); setVolume();
       }
       if (audio.ctx.state === 'suspended') audio.ctx.resume().catch(function () {});
     } catch (e) { audio.err = '失败: ' + e.name; logErr('audio ' + e.message); }
@@ -207,10 +236,10 @@ body {
     var c = audio.ctx, t = c.currentTime + (delay || 0), o = c.createOscillator(), g = c.createGain();
     o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
     g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + .01); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
-    o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + dur + .02);
+    o.connect(g); g.connect(audio.out); o.start(t); o.stop(t + dur + .02);
   }
-  function sfx(name, d) {
-    if (!audio.on || !audio.ctx || audio.ctx.state !== 'running') return;
+  function sfx(name, d, preview) {
+    if (!audio.on || !(preview || audio.kinds[SFX_KIND[name]]) || !audio.vol || !audio.ctx || audio.ctx.state !== 'running') return;
     try {
       if (name === 'bean') tone(1320, 1320, .06, 'square', .04);
       else if (name === 'power') { tone(440, 880, .25, 'triangle', .12); tone(660, 1320, .25, 'triangle', .08, .12); }
@@ -885,7 +914,7 @@ body {
     }
     L.push('最近的鬼 ' + (mg ? f(md, 1) + ' m（类型 ' + mg.type + (mg.fright > 0 ? '，虚弱' : '') + '）' : '—') + ' · 共 ' + ghosts.length + ' 只');
     if (state === 'play' && mode === 'gps') L.push('吃豆半径 ' + f(Math.max(10, Math.min(16, acc * .6)), 1) + ' m · 被抓半径 ' + f(Math.max(6, Math.min(12, acc * .5)), 1) + ' m');
-    L.push('声音 ' + (audio.on ? '开' : '关') + ' · ' + (audio.ctx ? audio.ctx.state : audio.err || '未启动'));
+    L.push('声音 ' + (audio.on ? '开' : '关') + ' · 音量 ' + audio.vol + ' · ' + (audio.ctx ? audio.ctx.state : audio.err || '未启动'));
     L.push('防熄屏 ' + dbg.wake + ' · 震动 ' + ('vibrate' in navigator ? '支持' : '不支持') + ' · https ' + (window.isSecureContext ? '是' : '否'));
     L.push('豆子布局 ' + ({ street: '沿街道', mixed: '混合（街道+网格）' }[layout] || '网格') + (roads ? ' · 街道 ' + roads.ways.length + ' 条' + (roads.err ? '（' + roads.err + '）' : ' · 来源 ' + (dbg.roadSrc || '—')) : ''));
     L.push('定位错误 ' + dbg.geoErr);
@@ -893,13 +922,28 @@ body {
     dbgEl.textContent = L.join('\n');
   }
   dbgBtn.addEventListener('click', function () { setDbg(!dbg.on); });
-  var sndBtn = document.getElementById('sndBtn');
-  function showSnd() { sndBtn.setAttribute('aria-pressed', audio.on ? 'true' : 'false'); sndBtn.textContent = audio.on ? '声音 开' : '声音 关'; }
-  sndBtn.addEventListener('click', function () {
-    audio.on = !audio.on;
-    try { localStorage.setItem('ghostbean-sound', audio.on ? '1' : '0'); } catch (e) {}
-    if (audio.on) { audioInit(); setTimeout(function () { sfx('bean'); }, 50); }
-    showSnd();
+  // sound settings panel: opened from the 声音 button; the game keeps running underneath
+  var sndBtn = document.getElementById('sndBtn'), sndEl = document.getElementById('snd'), sndOn = document.getElementById('sndOn'),
+      sndVol = document.getElementById('sndVol'), sndVolV = document.getElementById('sndVolV'), sndKinds = sndEl.querySelectorAll('[data-k]');
+  function showSnd() {
+    sndBtn.setAttribute('aria-pressed', audio.on ? 'true' : 'false'); sndBtn.textContent = audio.on ? '声音 开' : '声音 关';
+    sndOn.checked = audio.on; sndVol.value = audio.vol; sndVolV.textContent = audio.vol;
+    for (var i = 0; i < sndKinds.length; i++) { sndKinds[i].checked = audio.kinds[sndKinds[i].dataset.k]; sndKinds[i].disabled = !audio.on; }
+    sndVol.disabled = !audio.on;
+  }
+  sndBtn.addEventListener('click', function () { audioInit(); sndEl.hidden = !sndEl.hidden; showSnd(); });
+  document.getElementById('sndClose').addEventListener('click', function () { sndEl.hidden = true; });
+  sndOn.addEventListener('change', function () { audio.on = sndOn.checked; if (audio.on) audioInit(); saveSound(); showSnd(); });
+  sndVol.addEventListener('input', function () { audio.vol = +sndVol.value; setVolume(); sndVolV.textContent = audio.vol; });
+  sndVol.addEventListener('change', function () { saveSound(); sfx('bean'); });
+  for (var si = 0; si < sndKinds.length; si++) sndKinds[si].addEventListener('change', function (ev) {
+    audio.kinds[ev.target.dataset.k] = ev.target.checked; saveSound();
+  });
+  document.getElementById('sndTest').addEventListener('click', function () {
+    audioInit();
+    if (!audio.on) { toast('先打开声音'); return; }
+    if (!audio.vol) { toast('音量是 0'); return; }
+    setTimeout(function () { sfx('near', 10, true); }, 60);   // the preview plays even if the heartbeat is switched off
   });
   showSnd();
   var dbgInit = /[?&]debug=1/.test(location.search);
