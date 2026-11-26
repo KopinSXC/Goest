@@ -67,6 +67,7 @@ body {
 .rules li::before { content: ""; flex: none; width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; background: var(--route); }
 .rules li:nth-child(2)::before { background: var(--ghost); }
 .rules li:nth-child(3)::before { background: #4f7cff; }
+.rules.safe li::before { background: var(--warn); }
 .btns { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
 .btn { font: inherit; font-family: var(--f-display); font-weight: 700; font-size: 16px; letter-spacing: .1em; color: #04101d; background: var(--route); border: 0; border-radius: 10px; padding: 13px 18px; cursor: pointer; }
 .btn.alt { background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 500; font-size: 14px; letter-spacing: .04em; }
@@ -108,8 +109,14 @@ body {
         <p id="ovText">现实里只有你一个人在走。手机地图上，AI 会在你附近生成鬼，并朝你逼近。</p>
         <ul class="rules" id="ovRules">
           <li>带着手机在空旷处走动，走到豆子上就吃到。别停太久，鬼会贴上来。</li>
-          <li>鬼从你附近出现，吃的豆子越多越快，靠近时手机会震动。</li>
+          <li>鬼从你附近出现，吃的豆子越多越快。靠近时会响提示音，越近越急，安卓手机还会震动。</li>
           <li>大力豆会让鬼变蓝，这几秒内可以反过来吃掉它们。</li>
+        </ul>
+        <ul class="rules safe" id="ovSafe" hidden>
+          <li>只在人行道、广场、公园这些能走的地方走。</li>
+          <li>豆子在马路中间、车道上、水边或工地里，就别去吃。点它两次可以把它去掉。</li>
+          <li>过马路先看车。不要边走边盯着屏幕，要看就停下来看。</li>
+          <li>天黑、下雨、人多的时候，先注意脚下和身边。</li>
         </ul>
         <p class="note" id="ovNote">走路时留意车辆和周围，不要边走边盯着屏幕。</p>
         <div class="btns">
@@ -124,6 +131,7 @@ body {
     <div class="pill" id="threat" data-s="none">最近的鬼 —</div>
     <div class="pill" id="gps" data-s="none">定位未开启</div>
     <div class="hint" id="hint"></div>
+    <button class="dbgBtn" id="sndBtn" type="button" aria-pressed="true">声音</button>
     <button class="dbgBtn" id="dbgBtn" type="button" aria-pressed="false">调试</button>
   </footer>
 </div>
@@ -157,7 +165,7 @@ body {
   var origin = null, MX = 85000, MY = 110574, lastLL = null, fix = null, watchId = null, acc = 5;
   var P = { x: 0, y: 0 }, camP = { x: 0, y: 0 }, pv = { x: 0, y: 0 }, heading = null;
   var sim = { tx: 0, ty: 0 };
-  var accMax = 60, gotFixes = 0, locStart = 0;
+  var accMax = 60, gotFixes = 0, locStart = 0, safetyOk = false;
   var beans = [], ghosts = [], invuln = 0, toastT = 0, frightMax = 8, lastVib = 0;
   try { best = parseInt(localStorage.getItem('ghostbean-best') || '0', 10) || 0; } catch (e) {}
   // debug-only bookkeeping: raw fix, arrival intervals, last errors, wake lock state
@@ -174,10 +182,50 @@ body {
     power: document.getElementById('powerFill'), ov: document.getElementById('overlay'),
     ovEy: document.getElementById('ovEyebrow'), ovT: document.getElementById('ovTitle'),
     ovX: document.getElementById('ovText'), ovR: document.getElementById('ovRules'),
-    ovN: document.getElementById('ovNote'), ovB: document.getElementById('ovBtn'), ovB2: document.getElementById('ovBtn2')
+    ovN: document.getElementById('ovNote'), ovB: document.getElementById('ovBtn'), ovB2: document.getElementById('ovBtn2'),
+    ovS: document.getElementById('ovSafe')
   };
   function toast(s) { el.toast.textContent = s; el.toast.classList.add('on'); toastT = 1.8; }
   function vib(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {} }
+
+  /* ---------- sound: synthesized with Web Audio, so it also works on iPhones, which cannot vibrate ---------- */
+  // browsers only start audio from a tap, so audioInit() runs in the button and map tap handlers
+  var audio = { ctx: null, on: true, err: '' }, lastBeat = 0;
+  try { audio.on = localStorage.getItem('ghostbean-sound') !== '0'; } catch (e) {}
+  function audioInit() {
+    if (!audio.on) return;
+    try {
+      if (!audio.ctx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) { audio.err = '不支持'; return; }
+        audio.ctx = new AC();
+      }
+      if (audio.ctx.state === 'suspended') audio.ctx.resume().catch(function () {});
+    } catch (e) { audio.err = '失败: ' + e.name; logErr('audio ' + e.message); }
+  }
+  function tone(f0, f1, dur, type, vol, delay) {
+    var c = audio.ctx, t = c.currentTime + (delay || 0), o = c.createOscillator(), g = c.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(vol, t + .01); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + dur + .02);
+  }
+  function sfx(name, d) {
+    if (!audio.on || !audio.ctx || audio.ctx.state !== 'running') return;
+    try {
+      if (name === 'bean') tone(1320, 1320, .06, 'square', .04);
+      else if (name === 'power') { tone(440, 880, .25, 'triangle', .12); tone(660, 1320, .25, 'triangle', .08, .12); }
+      else if (name === 'eatGhost') tone(300, 1200, .2, 'square', .08);
+      else if (name === 'hit') tone(260, 60, .6, 'sawtooth', .18);
+      else if (name === 'clear') [523, 659, 784].forEach(function (f, i) { tone(f, f, .18, 'triangle', .12, i * .15); });
+      else if (name === 'near') {
+        // a heartbeat, louder the closer the ghost; triangle waves so small phone speakers still carry it
+        var v = .25 + (1 - d / NEAR_SOUND) * .35;
+        tone(180, 110, .12, 'triangle', v); tone(170, 100, .12, 'triangle', v * .7, .18);
+      }
+    } catch (e) { logErr('sfx ' + e.message); }
+  }
+  // heartbeat starts at NEAR_SOUND meters, one every 1.6 s there, down to one every 0.35 s when a ghost is on top of you
+  var NEAR_SOUND = 40;
   function hud() {
     el.score.textContent = score; el.beans.textContent = eaten + '/' + need; el.level.textContent = level;
     var h = '';
@@ -504,12 +552,17 @@ body {
   /* ---------- overlay ---------- */
   function showOverlay(kind, msg) {
     ovKind = kind; el.ov.hidden = false;
-    el.ovR.hidden = kind !== 'menu'; el.ovN.hidden = kind !== 'menu' && kind !== 'mapping'; el.ovB2.hidden = kind !== 'menu' && kind !== 'mapping';
+    el.ovR.hidden = kind !== 'menu'; el.ovS.hidden = kind !== 'safety';
+    el.ovN.hidden = kind !== 'menu' && kind !== 'mapping'; el.ovB2.hidden = kind !== 'menu' && kind !== 'mapping' && kind !== 'safety';
     if (kind === 'menu') {
       el.ovEy.textContent = 'GPS 定位玩法'; el.ovT.textContent = '躲鬼吃豆';
       el.ovX.textContent = '现实里只有你一个人在走。手机地图上，AI 会在你附近生成鬼，并朝你逼近。';
       el.ovN.textContent = '走路时留意车辆和周围，不要边走边盯着屏幕。';
       el.ovB.textContent = '用真实定位开始'; el.ovB2.textContent = '演示模式（点地图走路）';
+    } else if (kind === 'safety') {
+      el.ovEy.textContent = '开始之前'; el.ovT.textContent = '先看安全提示';
+      el.ovX.textContent = '这个游戏要在现实里走路。豆子和鬼都只在屏幕上，车和路面是真的。';
+      el.ovB.textContent = '我知道了，开始'; el.ovB2.textContent = '返回';
     } else if (kind === 'locating') {
       el.ovEy.textContent = '定位中'; el.ovT.textContent = '正在获取 GPS';
       el.ovX.textContent = '请允许定位权限，并尽量站在室外空旷处。'; el.ovB.textContent = '取消';
@@ -531,13 +584,21 @@ body {
     el.ovB.focus();
   }
   el.ovB.addEventListener('click', function () {
-    if (ovKind === 'menu') startGeo();
+    audioInit();
+    // real-GPS play asks for the safety screen once per page load before locating
+    if (ovKind === 'menu') { if (safetyOk) startGeo(); else showOverlay('safety'); }
+    else if (ovKind === 'safety') { safetyOk = true; startGeo(); }
     else if (ovKind === 'locating' || ovKind === 'error' || ovKind === 'mapping') { mapToken++; stopGeo(); state = 'menu'; showOverlay('menu'); }
     else if (ovKind === 'clear') { level++; begin(); }
     else { level = 1; score = 0; lives = 3; begin(); }
     if (state !== 'menu') wake();
   });
-  el.ovB2.addEventListener('click', function () { if (ovKind === 'locating') startLenient(); else if (ovKind === 'mapping') skipRoads(); else startSim(); wake(); });
+  el.ovB2.addEventListener('click', function () {
+    audioInit();
+    if (ovKind === 'safety') { showOverlay('menu'); return; }
+    if (ovKind === 'locating') startLenient(); else if (ovKind === 'mapping') skipRoads(); else startSim();
+    wake();
+  });
 
   /* ---------- game rules ---------- */
   function saveBest() { if (score > best) { best = score; try { localStorage.setItem('ghostbean-best', String(best)); } catch (e) {} } }
@@ -547,7 +608,7 @@ body {
     toast('大力豆！鬼变虚弱了，快去反吃');
   }
   function hit() {
-    lives--; hud(); vib([200, 80, 200]);
+    lives--; hud(); vib([200, 80, 200]); sfx('hit');
     if (lives <= 0) { state = 'over'; saveBest(); showOverlay('over'); return; }
     invuln = 4;
     ghosts.forEach(function (g) { placeGhost(g, 2.5, 80, 120); });
@@ -579,7 +640,7 @@ body {
     for (i = 0; i < beans.length; i++) {
       var b = beans[i];
       if (b.on && Math.hypot(b.x - P.x, b.y - P.y) < er) {
-        b.on = false; eaten++; score += b.power ? 50 : 10; vib(40);
+        b.on = false; eaten++; score += b.power ? 50 : 10; vib(40); sfx(b.power ? 'power' : 'bean');
         if (b.power) powerUp();
         hud();
       }
@@ -610,11 +671,12 @@ body {
     for (i = 0; i < ghosts.length; i++) {
       g = ghosts[i];
       if (g.spawn > 0 || Math.hypot(g.x - P.x, g.y - P.y) > cr) continue;
-      if (g.fright > 0) { score += 200; placeGhost(g, 3, 80, 120); toast('吃掉一只鬼 +200'); vib(100); hud(); }
+      if (g.fright > 0) { score += 200; placeGhost(g, 3, 80, 120); toast('吃掉一只鬼 +200'); vib(100); sfx('eatGhost'); hud(); }
       else if (invuln <= 0) { hit(); break; }
     }
-    if (state === 'play' && eaten >= need) { state = 'clear'; carry = total - eaten; saveBest(); vib(300); showOverlay('clear'); }
+    if (state === 'play' && eaten >= need) { state = 'clear'; carry = total - eaten; saveBest(); vib(300); sfx('clear'); showOverlay('clear'); }
     if (md < 20 && now - lastVib > 1500) { lastVib = now; vib(60); }
+    if (md < NEAR_SOUND && now - lastBeat > 350 + md / NEAR_SOUND * 1250) { lastBeat = now; sfx('near', md); }
     if (toastT > 0) { toastT -= dt; if (toastT <= 0) el.toast.classList.remove('on'); }
     el.power.style.width = (mf > 0 ? mf / frightMax * 100 : 0) + '%';
 
@@ -773,6 +835,7 @@ body {
   cv.addEventListener('pointerdown', function (ev) {
     // GPS mode starts from a location callback, not a tap; some browsers refuse the wake lock then, so retry on any tap
     if (state === 'play' && !wakeLock) wake();
+    audioInit();
     var r = cv.getBoundingClientRect();
     if (state === 'play' && mode === 'gps') { tapBean(ev.clientX - r.left, ev.clientY - r.top); return; }
     if (state !== 'play' || mode !== 'sim') return;
@@ -822,6 +885,7 @@ body {
     }
     L.push('最近的鬼 ' + (mg ? f(md, 1) + ' m（类型 ' + mg.type + (mg.fright > 0 ? '，虚弱' : '') + '）' : '—') + ' · 共 ' + ghosts.length + ' 只');
     if (state === 'play' && mode === 'gps') L.push('吃豆半径 ' + f(Math.max(10, Math.min(16, acc * .6)), 1) + ' m · 被抓半径 ' + f(Math.max(6, Math.min(12, acc * .5)), 1) + ' m');
+    L.push('声音 ' + (audio.on ? '开' : '关') + ' · ' + (audio.ctx ? audio.ctx.state : audio.err || '未启动'));
     L.push('防熄屏 ' + dbg.wake + ' · 震动 ' + ('vibrate' in navigator ? '支持' : '不支持') + ' · https ' + (window.isSecureContext ? '是' : '否'));
     L.push('豆子布局 ' + ({ street: '沿街道', mixed: '混合（街道+网格）' }[layout] || '网格') + (roads ? ' · 街道 ' + roads.ways.length + ' 条' + (roads.err ? '（' + roads.err + '）' : ' · 来源 ' + (dbg.roadSrc || '—')) : ''));
     L.push('定位错误 ' + dbg.geoErr);
@@ -829,6 +893,15 @@ body {
     dbgEl.textContent = L.join('\n');
   }
   dbgBtn.addEventListener('click', function () { setDbg(!dbg.on); });
+  var sndBtn = document.getElementById('sndBtn');
+  function showSnd() { sndBtn.setAttribute('aria-pressed', audio.on ? 'true' : 'false'); sndBtn.textContent = audio.on ? '声音 开' : '声音 关'; }
+  sndBtn.addEventListener('click', function () {
+    audio.on = !audio.on;
+    try { localStorage.setItem('ghostbean-sound', audio.on ? '1' : '0'); } catch (e) {}
+    if (audio.on) { audioInit(); setTimeout(function () { sfx('bean'); }, 50); }
+    showSnd();
+  });
+  showSnd();
   var dbgInit = /[?&]debug=1/.test(location.search);
   try { if (localStorage.getItem('ghostbean-debug') === '1') dbgInit = true; } catch (e) {}
   setDbg(dbgInit);
